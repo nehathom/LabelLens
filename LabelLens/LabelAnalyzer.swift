@@ -76,26 +76,51 @@ struct LabelAnalyzer {
             throw AnalyzerError.modelUnavailable(String(describing: reason))
         }
 
-        let labelText = lines.joined(separator: "\n")
+        let labelText = Self.relevantText(from: lines)
         guard !labelText.isEmpty else { throw AnalyzerError.noText }
 
+        // The on-device model has a small context window. Start with a capped
+        // amount of text and retry with less if it still overflows.
+        var limit = 1200
+        while true {
+            do {
+                let report = try await runModel(text: String(labelText.prefix(limit)), avoidList: avoidList)
+                return try validate(report, labelText: labelText, avoidList: avoidList)
+            } catch let error as LanguageModelSession.GenerationError {
+                if case .exceededContextWindowSize = error, limit > 300 {
+                    limit /= 2
+                    continue
+                }
+                throw error
+            }
+        }
+    }
+
+    private func runModel(text: String, avoidList: [String]) async throws -> LabelReport {
+        // A fresh session per attempt so earlier attempts don't use up context.
         let session = LanguageModelSession(
             tools: [AvoidListTool(avoidList: avoidList)],
             instructions: """
-            You read text captured from a product label by OCR. The text may contain OCR errors.
-            1. Identify the product and extract the ingredients exactly as they appear on the label.
-            2. Always call the checkAvoidList tool with the extracted ingredients.
-            3. Put only the tool's matches in `flagged`.
-            Do not add ingredients that are not in the text.
+            Extract the product name and ingredients from OCR text of a product label. \
+            Call checkAvoidList once with the ingredients. Put only its matches in flagged. \
+            Never invent ingredients.
             """
         )
-
         let response = try await session.respond(
-            to: "Label text:\n\(labelText)",
+            to: "Label text:\n\(text)",
             generating: LabelReport.self
         )
+        return response.content
+    }
 
-        return try validate(response.content, labelText: labelText, avoidList: avoidList)
+    /// Keep the first few lines (product name) plus everything from "ingredients" onward,
+    /// dropping nutrition-table noise that wastes the model's context.
+    static func relevantText(from lines: [String]) -> String {
+        if let start = lines.firstIndex(where: { $0.localizedCaseInsensitiveContains("ingredient") }) {
+            let header = lines.prefix(min(3, start))
+            return (header + lines[start...]).joined(separator: "\n")
+        }
+        return lines.joined(separator: "\n")
     }
 
     /// Never trust model output blindly: ground it in the OCR text and recompute flags in code.
